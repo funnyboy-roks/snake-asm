@@ -1,4 +1,4 @@
-# Snake ASM <sup>(name tbd)</sup>
+# Snake ASM
 
 A snake game, written in flat assembly without using libc!
 
