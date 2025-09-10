@@ -6,6 +6,8 @@ section ".bss" writeable
     snake_y       dq 15, 15, 15, 15, 15, 15, 15, 15, 15, 15
                   rq 246
     snake_len     dq 10
+    apple_x       dq 0
+    apple_y       dq 0
     rows          dq 0
     cols          dq 0
     dir           dq 0    ; 0 = right, 1 = up, 2 = left, 3 = down
@@ -37,11 +39,12 @@ STDIN_FD  = 0
 STDOUT_FD = 1
 STDERR_FD = 2
 
-SYS_READ       = 0x00
-SYS_WRITE      = 0x01
-SYS_EXIT       = 0x3c
-SYS_IOCTL      = 0x10
-SYS_NANOSLEEP  = 0x23
+SYS_READ       = 0x000
+SYS_WRITE      = 0x001
+SYS_EXIT       = 0x03c
+SYS_IOCTL      = 0x010
+SYS_NANOSLEEP  = 0x023
+SYS_GETRANDOM  = 0x13e
 
 CSI equ 0x1b, "["
 
@@ -118,6 +121,39 @@ draw_screen:
     mov rdi, STDOUT_FD
     mov rsi, clear_screen
     mov rdx, clear_screen_len
+    syscall
+
+
+    ; draw apple
+    mov rax, SYS_WRITE
+    mov rdi, STDOUT_FD
+    mov rsi, csi
+    mov rdx, csi_len
+    syscall
+
+    ; print apple_y
+    mov rax, qword [apple_y]
+    call print_dec
+
+    ; print semicolon
+    mov rax, ';'
+    push rax
+    mov rax, SYS_WRITE
+    mov rdi, STDOUT_FD
+    mov rsi, rsp
+    mov rdx, 1
+    syscall
+    pop rax
+
+    ; print apple_x
+    mov rax, qword [apple_x]
+    shl rax, 1
+    call print_dec
+
+    mov rax, SYS_WRITE
+    mov rdi, STDOUT_FD
+    mov rsi, apple_print_end
+    mov rdx, apple_print_end_len
     syscall
 
     ; draw snake
@@ -227,6 +263,51 @@ update_snake:
 
     ; update the head to be the new location
     mov [head], rcx
+
+    mov rsp, rbp
+    pop rbp
+    ret
+
+spawn_apple:
+    push rbp
+    mov rbp, rsp
+
+    ; two bytes for x ([rsp]) and y ([rsp+1])
+    sub rsp, 2
+
+    mov rax, SYS_GETRANDOM
+    mov rdi, rsp
+    mov rsi, 2
+    mov rdx, 0 ; not GRND_RANDOM and not GRND_NONBLOCK
+    syscall
+
+    ; zero rax
+    xor rax, rax
+
+    ; rax = [rsp] % [cols]
+    mov al, byte [rsp]
+    movzx ax, al
+    mov rdx, qword [cols]
+    sub rdx, 2
+    div dl
+    shr rax, 8
+    inc rax
+
+    mov [apple_x], rax
+
+    ; rax = [rsp+1] % [rows]
+    mov al, byte [rsp+1]
+    movzx ax, al
+    mov rdx, qword [rows]
+    sub rdx, 2
+    div dl
+    shr rax, 8
+    inc rax
+
+    mov [apple_y], rax
+
+    ; remove allocated bytes from random
+    add rsp, 2
 
     mov rsp, rbp
     pop rbp
@@ -370,7 +451,7 @@ read_input:
 .right:
 ; l -> right
     cmp dl, 'l'
-    jne .quit
+    jne .apple
 
     ; skip if already going horizontally
     mov rdx, [dir]
@@ -380,17 +461,73 @@ read_input:
 
     mov [dir], RIGHT
     jmp .done
+.apple:
+    cmp dl, 'r'
+    jne .quit
+    call spawn_apple
+    jmp .done
 .quit:
     cmp dl, 'q'
     jne .done
     call quit ; -> !
 .done:
 
+
+grow_snake:
+    push rbp
+    mov rbp, rsp
+
+    ; Copy data from snake_x[head..snake_len] to snake_x[(head+1)..(snake_len+1)]
+    mov rcx, [snake_len]
+    sub rcx, [head]          ; rcx <- snake_len - head
+    mov rdi, [snake_len]
+    lea rdi, [snake_x+rdi*8] ; rdi <- snake_x[snake_len]
+    mov rsi, [snake_len]
+    dec rsi
+    lea rsi, [snake_x+rsi*8] ; rsi <- snake_x[snake_len-1]
+    std
+    rep movsq
+
+    ; Copy data from snake_y[head..snake_len] to snake_y[(head+1)..(snake_len+1)]
+    mov rcx, [snake_len]
+    sub rcx, [head]          ; rcx <- snake_len - head
+    mov rdi, [snake_len]
+    lea rdi, [snake_y+rdi*8] ; rdi <- snake_y[snake_len]
+    mov rsi, [snake_len]
+    dec rsi
+    lea rsi, [snake_y+rsi*8] ; rsi <- snake_y[snake_len-1]
+    std
+    rep movsq
+
+    inc qword [snake_len]
+
     mov rsp, rbp
     pop rbp
     ret
 
-check_collisions:
+
+handle_apple_collision:
+    push rbp
+    mov rbp, rsp
+
+    mov r9, [head]
+    mov r8, [snake_x+r9*8]
+    mov r9, [snake_y+r9*8]
+
+    cmp r8, [apple_x]
+    jne .return
+    cmp r9, [apple_y]
+    jne .return
+
+    call grow_snake
+    call spawn_apple
+
+.return:
+    mov rsp, rbp
+    pop rbp
+    ret
+
+handle_collisions:
     push rbp
     mov rbp, rsp
 
@@ -441,7 +578,7 @@ check_collisions:
     mov rsp, rbp
     pop rbp
     ret
-    
+
 
 ; NEVER RETURNS
 quit:
@@ -460,7 +597,18 @@ die:
     mov rsi, you_died
     mov rdx, you_died_len
     syscall
-    
+
+    ; Print snake length
+    mov rax, [snake_len]
+    call print_dec
+
+    ; newline message
+    mov rax, SYS_WRITE
+    mov rdi, STDOUT_FD
+    mov rsi, newline
+    mov rdx, newline_len
+    syscall
+
     call quit
 
 public _start
@@ -471,6 +619,7 @@ _start:
     mov rdx, hide_cursor_len
     syscall
 
+
     call window_size
     mov [rows], rax
     add [rows], 2
@@ -478,14 +627,17 @@ _start:
     add [cols], 2
     shr qword [cols], 1
 
+    call spawn_apple
+
     call enter_raw_mode
 
 .loop:
     call draw_screen
     call update_snake
-    call check_collisions
+    call handle_collisions
+    call handle_apple_collision
     call sleep
-    
+
     call read_input
     jmp .loop
 
@@ -503,11 +655,14 @@ move_origin_len = $ - move_origin
 clear_screen: db CSI, "2J"
 clear_screen_len = $ - clear_screen
 
-snake_print_end: db "H██"
+snake_print_end: db "H", CSI, "32m██", CSI, "0m"
 snake_print_end_len = $ - snake_print_end
+
+apple_print_end: db "H", CSI, "31m@@", CSI, "0m"
+apple_print_end_len = $ - apple_print_end
 
 hide_cursor: db CSI, "?25l"
 hide_cursor_len = $ - hide_cursor
 
-you_died: db CSI, "999999;0H", CSI, "31mYou Died!", CSI, "0m", 10
+you_died: db CSI, "999999;0H", CSI, "31mYou Died!", CSI, "0m", 10, "Snake Length: "
 you_died_len = $ - you_died
